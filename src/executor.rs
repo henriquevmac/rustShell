@@ -1,5 +1,6 @@
 use crate::parser::{Command, StdoutType};
 
+use std::ffi::CString;
 use std::io;
 use std::os::fd::OwnedFd;
 use std::path::Path;
@@ -20,15 +21,15 @@ fn open_or_exit(filename: &str, flags: OFlag) -> OwnedFd {
     }
 }
 
-fn handle_output(stdout: Option<(StdoutType, &str)>, stdin: Option<&str>) -> io::Result<()> {
+fn handle_output(stdout: Option<(StdoutType, String)>, stdin: Option<String>) -> io::Result<()> {
     match stdout {
         Some((direction, filename)) => match direction {
             StdoutType::Truncate => {
-                let fd = open_or_exit(filename, OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_TRUNC);
+                let fd = open_or_exit(&filename, OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_TRUNC);
                 dup2_stdout(&fd)?;
             }
             StdoutType::Append => {
-                let fd = open_or_exit(filename, OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_APPEND);
+                let fd = open_or_exit(&filename, OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_APPEND);
                 dup2_stdout(&fd)?;
             }
         },
@@ -36,7 +37,7 @@ fn handle_output(stdout: Option<(StdoutType, &str)>, stdin: Option<&str>) -> io:
     }
     match stdin {
         Some(filename) => {
-            let fd = open_or_exit(filename, OFlag::O_RDONLY);
+            let fd = open_or_exit(&filename, OFlag::O_RDONLY);
             dup2_stdin(&fd)?;
         }
         None => {}
@@ -53,19 +54,21 @@ fn exec_child(command: Command) -> ! {
             std::process::exit(1);
         }
     }
-    let Err(e) = execvp(&command.args[0], &command.args);
-    let cmd = command.cmd;
-    eprintln!("rsh: {cmd}: {e}");
+    let cargs: Vec<CString> = command.args.iter()
+        .map(|a| CString::new(a.as_str()).unwrap())
+        .collect();
+    let Err(e) = execvp(&cargs[0], &cargs);
+    eprintln!("rsh: {}: {e}", command.args[0]);
     std::process::exit(127);
 }
 
 pub fn execute_command(command: Command, last_status: i32) -> io::Result<i32> {
-    match command.cmd {
+    match command.args[0].as_str() {
         "exit" => {
             let code = command
                 .args
                 .get(1)
-                .and_then(|a| a.to_str().ok()?.parse().ok())
+                .and_then(|a| a.parse().ok())
                 .unwrap_or(last_status);
             std::process::exit(code);
         }
@@ -78,7 +81,7 @@ pub fn execute_command(command: Command, last_status: i32) -> io::Result<i32> {
                     }
                 }
             } else {
-                let path = command.args.get(1).unwrap().to_str().unwrap();
+                let path = command.args.get(1).unwrap();
                 if let Err(e) = std::env::set_current_dir(Path::new(path)) {
                     eprintln!("rsh: cd: {path}: {e}");
                     return Ok(1);
