@@ -5,9 +5,10 @@ use std::os::fd::OwnedFd;
 use std::path::Path;
 
 use nix::fcntl::{OFlag, open};
+use nix::sys::signal::{SigHandler, Signal, signal};
 use nix::sys::stat::Mode;
 use nix::sys::wait::{WaitStatus, waitpid};
-use nix::unistd::{ForkResult, dup2_stdin, dup2_stdout, execvp, fork};
+use nix::unistd::{ForkResult, dup2_stdin, dup2_stdout, execvp, fork, pipe2};
 
 fn open_or_exit(filename: &str, flags: OFlag) -> OwnedFd {
     match open(filename, flags, Mode::from_bits_truncate(0o644)) {
@@ -43,7 +44,22 @@ fn handle_output(stdout: Option<(StdoutType, &str)>, stdin: Option<&str>) -> io:
     Ok(())
 }
 
-pub fn executor(command: Command, last_status: i32) -> io::Result<i32> {
+fn exec_child(command: Command) -> ! {
+    unsafe { signal(Signal::SIGPIPE, SigHandler::SigDfl) }.ok();
+    match handle_output(command.stdout, command.stdin) {
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("rsh: error handling redirection {e}");
+            std::process::exit(1);
+        }
+    }
+    let Err(e) = execvp(&command.args[0], &command.args);
+    let cmd = command.cmd;
+    eprintln!("rsh: {cmd}: {e}");
+    std::process::exit(127);
+}
+
+pub fn execute_command(command: Command, last_status: i32) -> io::Result<i32> {
     match command.cmd {
         "exit" => {
             let code = command
@@ -58,7 +74,7 @@ pub fn executor(command: Command, last_status: i32) -> io::Result<i32> {
                 if let Some(home_dir) = std::env::home_dir() {
                     if let Err(e) = std::env::set_current_dir(home_dir) {
                         eprintln!("rsh: cd: {e}");
-                        return Ok(1)
+                        return Ok(1);
                     }
                 }
             } else {
@@ -68,7 +84,7 @@ pub fn executor(command: Command, last_status: i32) -> io::Result<i32> {
                     return Ok(1);
                 }
             }
-            return Ok(0)
+            return Ok(0);
         }
         _ => match unsafe { fork() }? {
             ForkResult::Parent { child } => {
@@ -77,13 +93,53 @@ pub fn executor(command: Command, last_status: i32) -> io::Result<i32> {
                 }
             }
             ForkResult::Child => {
-                handle_output(command.stdout, command.stdin)?;
-                let Err(e) = execvp(&command.args[0], &command.args);
-                let cmd = command.cmd;
-                eprintln!("rsh: {cmd}: {e}");
-                std::process::exit(127);
+                exec_child(command);
             }
         },
     }
+    Ok(last_status)
+}
+
+pub fn execute_pipeline(commands: Vec<Command>) -> io::Result<i32> {
+    let n = commands.len();
+    let mut prev_read: Option<OwnedFd> = None;
+    let mut children = Vec::new();
+    let mut last_status = -1;
+
+    for (i, command) in commands.into_iter().enumerate() {
+        let (next_read, write) = if i < n - 1 {
+            let (r, w) = pipe2(OFlag::O_CLOEXEC)?;
+            (Some(r), Some(w))
+        } else {
+            (None, None)
+        };
+
+        match unsafe { fork() }? {
+            ForkResult::Child => {
+                if prev_read.is_some() {
+                    match dup2_stdin(prev_read.unwrap()) {
+                        Ok(_) => {},
+                        Err(_) => std::process::exit(1),
+                    }
+                }
+                if write.is_some() {
+                    match dup2_stdout(write.unwrap()) {
+                        Ok(_) => {},
+                        Err(_) => std::process::exit(1),
+                    }
+                }
+                exec_child(command)
+            }
+            ForkResult::Parent { child } => children.push(child),
+        }
+
+        prev_read = next_read;
+    }
+
+    for child in children {
+        if let WaitStatus::Exited(_, code) = waitpid(child, None)? {
+            last_status = code;
+        }
+    };
     Ok(last_status)
 }
