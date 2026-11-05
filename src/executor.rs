@@ -47,6 +47,8 @@ fn handle_output(stdout: Option<(StdoutType, String)>, stdin: Option<String>) ->
 
 fn exec_child(command: Command) -> ! {
     unsafe { signal(Signal::SIGPIPE, SigHandler::SigDfl) }.ok();
+    unsafe { signal(Signal::SIGINT, SigHandler::SigDfl) }.ok();
+    unsafe { signal(Signal::SIGQUIT, SigHandler::SigDfl) }.ok();
     match handle_output(command.stdout, command.stdin) {
         Ok(_) => {}
         Err(e) => {
@@ -60,6 +62,19 @@ fn exec_child(command: Command) -> ! {
     let Err(e) = execvp(&cargs[0], &cargs);
     eprintln!("rsh: {}: {e}", command.args[0]);
     std::process::exit(127);
+}
+
+fn status_code(status: WaitStatus) -> i32 {
+    match status {
+        WaitStatus::Exited(_, code) => code,
+        WaitStatus::Signaled(_, sig, _) => {
+            if sig == Signal::SIGINT {
+                println!()
+            }
+            128 + sig as i32
+        },
+        _ => 0,
+    }
 }
 
 pub fn execute_command(command: Command, last_status: i32) -> io::Result<i32> {
@@ -91,23 +106,19 @@ pub fn execute_command(command: Command, last_status: i32) -> io::Result<i32> {
         }
         _ => match unsafe { fork() }? {
             ForkResult::Parent { child } => {
-                if let WaitStatus::Exited(_, code) = waitpid(child, None)? {
-                    return Ok(code);
-                }
+                return Ok(status_code(waitpid(child, None)?))
             }
             ForkResult::Child => {
                 exec_child(command);
             }
         },
     }
-    Ok(last_status)
 }
 
 pub fn execute_pipeline(commands: Vec<Command>) -> io::Result<i32> {
     let n = commands.len();
     let mut prev_read: Option<OwnedFd> = None;
     let mut children = Vec::new();
-    let mut last_status = -1;
 
     for (i, command) in commands.into_iter().enumerate() {
         let (next_read, write) = if i < n - 1 {
@@ -139,10 +150,9 @@ pub fn execute_pipeline(commands: Vec<Command>) -> io::Result<i32> {
         prev_read = next_read;
     }
 
+    let mut last = None;
     for child in children {
-        if let WaitStatus::Exited(_, code) = waitpid(child, None)? {
-            last_status = code;
-        }
+        last = Some(waitpid(child, None)?);
     };
-    Ok(last_status)
+    Ok(last.map(status_code).unwrap_or(0))
 }
